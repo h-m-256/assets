@@ -134,6 +134,73 @@ def create_settings(self):
 # - __requirements__ удобнее для статических зависимостей
 # - MandrePip удобнее для динамической/условной установки
 
+
+=== ФОРМАТИРОВАНИЕ ТЕКСТА В СООБЩЕНИЯХ ===
+
+# ❌ НЕЛЬЗЯ использовать markdown-звёздочки напрямую в тексте сообщения:
+# params.message = "**жирный**"   — НЕ РАБОТАЕТ, отправится как есть со звёздочками
+# params.message = "*жирный*"     — НЕ РАБОТАЕТ
+
+# ✅ ПРАВИЛЬНЫЙ способ — markdown_utils.parse_markdown + entities
+
+from markdown_utils import parse_markdown
+from client_utils import send_message
+
+# Синтаксис форматирования:
+# *жирный*
+# _курсив_
+# __подчёркнутый__
+# ~зачёркнутый~
+# ||спойлер||
+# `инлайн код`
+# ```блок кода```
+# ```python
+код
+```
+# [текст ссылки](https://example.com)
+# [эмодзи](document_id)  — кастомный эмодзи
+
+# Пример отправки форматированного сообщения:
+try:
+    parsed = parse_markdown("*Привет!* Это _курсив_ и `код`")
+    text = parsed.text        # чистый текст без маркеров
+    entities = [e.to_tlrpc_object() for e in parsed.entities]
+
+    send_message(
+        account_id=0,
+        dialog_id=dialog_id,
+        message=text,
+        entities=entities
+    )
+except SyntaxError as e:
+    self.log(f"Неправильный markdown: {e}")
+
+# Пример в on_send_message_hook (модификация исходящего сообщения):
+def on_send_message_hook(self, acc, params):
+    try:
+        parsed = parse_markdown("*жирный текст*")
+        params.message = parsed.text
+        params.entities = [e.to_tlrpc_object() for e in parsed.entities]
+        return HookResult(strategy=HookStrategy.MODIFY, params=params)
+    except SyntaxError:
+        return HookResult()
+
+# ParsedMessage атрибуты:
+# parsed.text      — str, чистый текст
+# parsed.entities  — tuple[RawEntity, ...]
+
+# RawEntity атрибуты:
+# entity.type          — TLEntityType (BOLD, ITALIC, CODE, и т.д.)
+# entity.offset        — int, позиция в UTF-16
+# entity.length        — int, длина в UTF-16
+# entity.url           — str или None (для TEXT_LINK)
+# entity.language      — str или None (для PRE блоков)
+# entity.document_id   — int или None (для CUSTOM_EMOJI)
+# entity.to_tlrpc_object() — конвертировать в TLRPC.MessageEntity
+
+# Экранирование спецсимволов:
+# \* \_ \~ \| \` \[ \] \\  — отображаются как есть
+
 === ОФИЦИАЛЬНАЯ ДОКУМЕНТАЦИЯ EXTERAGRAM SDK ===
 Introduction | exteraGram
 ===============
@@ -7211,6 +7278,7 @@ text = Text(
     icon="msg_log",
     on_click=lambda _: print("Logs clicked")
 )
+# ⚠️ Text НЕ поддерживает параметр subtext — только Switch и Input имеют subtext
 
 ---
 
@@ -7457,9 +7525,12 @@ height = cell.getHeight()
 ❌ zwylib.build_log() → использовать self.log()
 ❌ ApplicationLoader.applicationContext для окон → ctx.get("context")
 ❌ bulletin_helper напрямую → zwylib.build_bulletin_helper() или Toast
+❌ АВТО-ПЕРЕВОД через TranslateController — не работает без Telegram Premium.
+   toggleTranslatingDialog/setDialogTranslateTo вызываются без ошибок, но перевод не появляется.
+   isFeatureAvailable() возвращает false без Premium.
 ❌ РЕДАКТИРОВАНИЕ СООБЩЕНИЙ — невозможно реализовать в плагинах.
-   Нет доступного API для изменения уже отправленных сообщений.
-   Ни один разработчик плагинов не реализовывал эту функцию.
+   SendMessagesHelper.editMessage() существует но не работает из плагина.
+   Ни один разработчик плагинов не реализовывал эту функцию (хотя спрос есть).
    Не предлагать и не пытаться реализовать редактирование сообщений в плагине.
 
 === РАСШИРЕННЫЙ СПИСОК ИЗВЕСТНЫХ КЛАССОВ ===
@@ -9252,3 +9323,316 @@ class MyPlugin(BasePlugin):
         finally:
             self._sending = False
         return HookResult(strategy=HookStrategy.CANCEL)
+
+=== ПАТТЕРНЫ ИЗ tg_method_dumper (реальный плагин) ===
+
+--- Collections.list() — обход бага Chaquopy с Enumeration ---
+
+# Chaquopy не может вызвать nextElement() у анонимных Java Enumeration объектов.
+# Решение: конвертировать через Collections.list() → ArrayList.
+
+from java import jclass
+Collections = jclass("java.util.Collections")
+
+# ❌ НЕ РАБОТАЕТ:
+# while entries.hasMoreElements():
+#     item = entries.nextElement()   # AttributeError: nextElement is abstract
+
+# ✅ РАБОТАЕТ:
+entries_enum = some_java_object.entries()
+entries_list = Collections.list(entries_enum)   # → java.util.ArrayList
+size = int(entries_list.size())
+for i in range(size):
+    item = str(entries_list.get(i))
+
+--- Правильный ClassLoader для Class.forName ---
+
+# В фоновом потоке Chaquopy используется Python classloader — он не видит
+# классы из MultiDex (дополнительных .dex файлов Telegram).
+# Нужно использовать classloader самого приложения.
+
+from java import jclass
+ApplicationLoader = jclass("org.telegram.messenger.ApplicationLoader")
+Class = jclass("java.lang.Class")
+
+context = ApplicationLoader.applicationContext
+class_loader = context.getClassLoader()   # classloader Telegram — видит всё
+
+# Загрузка класса по имени:
+clazz = Class.forName("org.telegram.ui.ChatActivity", False, class_loader)
+# False = не инициализировать статические блоки сразу
+
+--- Итерация по Java-массиву методов ---
+
+# getDeclaredMethods() возвращает Java-массив, не Python list.
+# hasattr(methods, 'length') — проверка что это Java-массив.
+
+methods = clazz.getDeclaredMethods()
+m_len = int(methods.length) if hasattr(methods, 'length') else len(methods)
+for j in range(m_len):
+    method = methods[j]
+    self.log(method.toString())
+
+# toString() метода выдаёт полную сигнатуру:
+# "public void org.telegram.ui.ChatActivity.onResume()"
+
+--- Mandre.Share.share_file — шаринг файла ---
+
+# Поделиться файлом через Telegram или другие приложения:
+from mandre_lib import Mandre
+
+Mandre.Share.share_file(
+    "/data/data/com.exteragram.messenger/files/dump.txt",
+    "Заголовок",    # title
+    "text/plain"    # MIME-тип
+)
+
+--- Divider с текстом ---
+
+# Divider поддерживает необязательный параметр text:
+from ui.settings import Divider
+
+Divider()                            # просто разделитель
+Divider(text="Опасная зона")         # разделитель с подписью
+
+--- DexFile — дамп всех классов приложения ---
+
+# Получить список всех классов из APK:
+from java import jclass
+
+DexFile = jclass("dalvik.system.DexFile")
+Collections = jclass("java.util.Collections")
+Class = jclass("java.lang.Class")
+ApplicationLoader = jclass("org.telegram.messenger.ApplicationLoader")
+
+context = ApplicationLoader.applicationContext
+apk_path = context.getApplicationInfo().sourceDir   # путь к base.apk
+class_loader = context.getClassLoader()
+
+dex = DexFile(apk_path)
+all_classes = Collections.list(dex.entries())   # ArrayList всех имён классов
+
+for i in range(int(all_classes.size())):
+    class_name = str(all_classes.get(i))
+    if class_name.startswith("org.telegram."):
+        try:
+            clazz = Class.forName(class_name, False, class_loader)
+            # работаем с классом...
+        except Exception:
+            pass   # синтетические классы ($1, -IA) — нормально не грузятся
+
+=== МЕТОДЫ ChatActivity (из дампа рефлексии 12.5.1) ===
+
+# Получить экземпляр ChatActivity через хук onResume:
+# param.thisObject — это ChatActivity
+
+--- Полезные public методы ---
+
+# Текущий dialog ID:
+dialog_id = chat_activity.getDialogId()   # long
+
+# Текущее сообщение для ответа:
+reply_msg = chat_activity.getReplyMessage()   # MessageObject или None
+
+# Прокрутка к сообщению:
+chat_activity.scrollToMessageId(msg_id, 0, True, 0, True, 0)
+
+# Удаление истории:
+chat_activity.deleteHistory(from_id, to_id, True)
+
+# Открыть панель редактирования сообщения (UI — не отправляет на сервер):
+chat_activity.showFieldPanelForEdit(True, message_object)
+
+# Открыть панель ответа:
+chat_activity.showFieldPanelForReply(message_object)
+
+# Закрыть меню ⋮:
+chat_activity.closeMenu()
+
+# Проверить можно ли отправлять:
+can_send = chat_activity.canSendMessage()   # bool
+
+# Получить поле ввода:
+enter_view = chat_activity.getChatActivityEnterView()
+
+--- fillMessageMenu — хук для добавления пунктов в контекстное меню ---
+
+# fillMessageMenu вызывается при долгом нажатии на сообщение.
+# Принимает MessageObject и три ArrayList (пункты меню).
+# Хук after позволяет добавить свой пункт в уже заполненный список.
+
+class FillMenuHook(MethodHook):
+    def after_hooked_method(self, param):
+        msg = param.args[0]          # MessageObject
+        items = param.args[1]        # ArrayList — пункты меню
+        # добавить пункт: items.add("Мой пункт")
+        # перехватить обработку через processSelectedOption
+
+--- processSelectedOption — перехват нажатия пункта меню ---
+
+# processSelectedOption(int) вызывается при нажатии на пункт контекстного меню.
+# int — индекс/id пункта.
+
+class ProcessOptionHook(MethodHook):
+    def after_hooked_method(self, param):
+        option_id = int(param.args[0])
+        self.plugin.log(f"Нажат пункт меню: {option_id}")
+
+--- Жизненный цикл ChatActivity для хуков ---
+
+# onResume   — чат открыт/возвращён в фокус
+# onPause    — чат свёрнут
+# onFragmentCreate  — фрагмент создан (раньше onResume)
+# onFragmentDestroy — фрагмент уничтожен
+
+# Хук на onResume (самый частый):
+cls = find_class("org.telegram.ui.ChatActivity")
+m = cls.getClass().getDeclaredMethod("onResume")
+self.hook_method(m, MyResumeHook(self))
+
+=== ПОЛЕЗНЫЕ МЕТОДЫ ИЗ ДАМПА РЕФЛЕКСИИ (12.5.1) ===
+
+--- FileLoader — работа с файлами ---
+
+from java import jclass
+from client_utils import get_account_instance  # если нужен account
+
+FileLoader = jclass("org.telegram.messenger.FileLoader")
+fl = FileLoader.getInstance(account_id)  # account_id обычно 0
+
+# Получить локальный путь к медиафайлу (если уже скачан):
+file = fl.getPathToAttach(message_object.getDocument())  # java.io.File
+if file and file.exists():
+    path = str(file.getAbsolutePath())
+
+# Получить путь с mime-типом:
+file = fl.getPathToAttach(tlObject, "mp4", False)
+
+# Скачать файл:
+fl.loadFile(image_location, parent_object, file_name, priority, cacheType)
+# priority: 0=низкий, 1=обычный, 2=высокий
+# cacheType: 0=без кэша, 1=кэш
+
+# Получить директорию для типа файла:
+dir = FileLoader.getDirectory(FileLoader.MEDIA_DIR_IMAGE)  # java.io.File
+
+# Имя файла по TLObject:
+name = FileLoader.getAttachFileName(tl_object)  # String
+
+--- TranslateController — перевод (только с Premium) ---
+
+# ⚠️ Без Premium не работает — isFeatureAvailable() = false
+
+from client_utils import get_messages_controller
+tc = get_messages_controller().getTranslateController()
+
+# Проверки:
+tc.isFeatureAvailable()                  # bool — есть ли Premium
+tc.isTranslatable(message_object)        # bool — можно ли перевести сообщение
+tc.isTranslating(message_object)         # bool — переводится ли сейчас
+tc.isTranslatingDialog(dialog_id)        # bool — включён ли авто-перевод диалога
+tc.getDialogTranslateTo(dialog_id)       # str — текущий язык перевода диалога ("ru", "en"...)
+tc.getDialogDetectedLanguage(dialog_id)  # str — определённый язык диалога
+
+# Управление (требует Premium):
+tc.setDialogTranslateTo(dialog_id, "en")          # установить язык перевода
+tc.toggleTranslatingDialog(dialog_id, True)        # вкл/выкл авто-перевод
+tc.checkTranslation(message_object, True)          # запросить перевод сообщения
+tc.invalidateTranslation(message_object)           # сбросить перевод
+tc.cancelTranslations(dialog_id)                   # отменить все переводы диалога
+
+# Языки:
+languages = tc.getLanguages()   # ArrayList доступных языков
+locales = tc.getLocales()       # ArrayList локалей
+
+--- ChatActivity — полезные public методы ---
+
+# Получить экземпляр через хук onResume (param.thisObject)
+
+chat_activity.getDialogId()                          # long — текущий dialog ID
+chat_activity.getReplyMessage()                      # MessageObject — текущий reply
+chat_activity.getChatActivityEnterView()             # поле ввода
+chat_activity.getChatListView()                      # RecyclerListView сообщений
+chat_activity.scrollToMessageId(msg_id, 0, True, 0, True, 0)
+chat_activity.scrollToLastMessage(True, True)
+chat_activity.deleteHistory(from_id, to_id, True)
+chat_activity.showFieldPanelForReply(message_object) # открыть панель ответа
+chat_activity.canSendMessage()                       # bool
+chat_activity.closeMenu()                            # закрыть меню ⋮
+chat_activity.clearSelectionMode()                   # снять выделение сообщений
+
+--- MediaDataController — стикеры, реакции, черновики ---
+
+from java import jclass
+MediaDataController = jclass("org.telegram.messenger.MediaDataController")
+mdc = MediaDataController.getInstance(account_id)
+
+# Двойное нажатие — реакция:
+mdc.setDoubleTapReaction("👍")        # поменять реакцию на двойной тап
+mdc.getDoubleTapReaction()            # текущая реакция
+
+# Стикерпаки:
+mdc.isStickerPackInstalled("PackName")         # bool
+mdc.isStickerPackInstalled(pack_id)            # bool по id
+mdc.getStickerSets(0)                          # ArrayList всех стикерпаков (0=обычные)
+mdc.getRecentStickers(0)                       # ArrayList недавних стикеров
+mdc.clearRecentStickers()                      # очистить
+mdc.loadStickers(0, False, True)               # загрузить стикеры
+# toggleStickerSet — установить/удалить стикерпак:
+# mdc.toggleStickerSet(context, tl_object, 2, fragment, True, True)
+# type: 0=удалить, 1=архивировать, 2=добавить
+
+# Реакции:
+mdc.getRecentReactions()              # ArrayList недавних реакций
+mdc.getTopReactions()                 # ArrayList топ реакций
+mdc.getEnabledReactionsList()         # List доступных реакций
+mdc.getSavedReactions()               # ArrayList сохранённых реакций
+mdc.clearRecentReactions()            # очистить историю реакций
+
+# Черновики:
+drafts = mdc.getDrafts()              # LongSparseArray — ключ dialog_id
+mdc.cleanDraft(dialog_id, 0, False)   # удалить черновик
+
+# GIF:
+mdc.getRecentGifs()                   # ArrayList недавних GIF
+
+# Форматирование текста:
+entities = mdc.getEntities([text], True)  # ArrayList entities из текста
+
+--- NotificationCenter — события приложения ---
+
+from java import jclass
+NotificationCenter = jclass("org.telegram.messenger.NotificationCenter")
+nc = NotificationCenter.getInstance(account_id)
+nc_global = NotificationCenter.getGlobalInstance()
+
+# Подписаться на одно событие:
+nc.listenOnce(NotificationCenter.didReceiveNewMessages, lambda: self.log("new msg"))
+
+# Проверить наличие подписчиков:
+nc.hasObservers(NotificationCenter.didReceiveNewMessages)
+
+# Отправить событие:
+nc.postNotificationName(NotificationCenter.didReceiveNewMessages, [])
+
+--- ContactsController ---
+
+from java import jclass
+ContactsController = jclass("org.telegram.messenger.ContactsController")
+cc = ContactsController.getInstance(account_id)
+
+cc.isContact(user_id)                 # bool — является ли юзер контактом
+cc.formatName(tl_user_object)         # String — форматировать имя
+cc.formatName("Иван", "Иванов")       # String — из имени и фамилии
+cc.getPrivacyRules(0)                 # ArrayList правил приватности
+
+--- DownloadController ---
+
+from java import jclass
+DownloadController = jclass("org.telegram.messenger.DownloadController")
+dc = DownloadController.getInstance(account_id)
+
+dc.canDownloadMedia(message_object)           # bool — можно ли автоскачать
+dc.isDownloading(type)                        # bool — идёт ли загрузка
+dc.hasUnviewedDownloads()                     # bool
+dc.getAutodownloadMask()                      # int — маска автоскачивания
